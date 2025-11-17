@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alphasanta"
+version = "0.1.0"
+description = "AlphaSanta multi-agent crypto analysis built on Spoon Core"
+requires-python = ">=3.12.0,<3.14"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Charlie Sun" }
+]
+dependencies = [
+  "spoon-ai-sdk @ git+https://github.com/XSpoonAi/spoon-core.git",
+  "spoon-toolkits @ git+https://github.com/XSpoonAi/spoon-toolkit.git",
+  "python-dotenv>=1.0",
+  "uvicorn>=0.30",
+  "httpx>=0.27",
+  "pytest>=8.0", 
+  "pytest-asyncio>=0.23", 
+  "ruff>=0.5",
+  "a2a-sdk @ git+https://github.com/google/a2a-python.git",
+]
+
+[project.scripts]
+alphasanta-micro-card = "alphasanta.cli.micro_card:main"
+alphasanta-mood-card = "alphasanta.cli.mood_card:main"
+alphasanta-macro-card = "alphasanta.cli.macro_card:main"
+alphasanta-santa-card = "alphasanta.cli.santa_card:main"
+alphasanta-run-all-cards = "alphasanta.cli.run_all_cards:main"
+alphasanta-start = "alphasanta.cli.start:main"
+alphasanta-run-council = "alphasanta.cli.council_runner:main"
+
+[tool.setuptools.packages.find]
+include = ["alphasanta*"]
