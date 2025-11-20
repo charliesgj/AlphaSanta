@@ -38,7 +38,7 @@ class A2AElfTransport(ElfTransport):
             from a2a.types import MessageSendParams, SendMessageRequest
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise RuntimeError(
-                "A2A SDK not installed. Install with `pip install 'alphasanta[agentcard]'` to enable A2A transport."
+                "A2A SDK not installed. Ensure the default installation succeeded or install `google-a2a`."
             ) from exc
 
         self._A2AClient = A2AClient
@@ -135,7 +135,6 @@ class A2AElfTransport(ElfTransport):
             "token": letter.token,
             "thesis": letter.thesis,
             "source": letter.source,
-            "wallet_address": letter.wallet_address,
             "user_id": letter.user_id,
             "metadata": letter.metadata or {},
         }

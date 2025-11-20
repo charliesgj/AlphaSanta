@@ -10,11 +10,7 @@ from alphasanta.schema import UserLetter, SantaDecision
 class StubSanta:
     decisions: List[str]
 
-    async def process_letter(self, letter: UserLetter, alpha_signal=None):
-        verdict = self.decisions.pop(0)
-        return SantaDecision(verdict=verdict, publish=False, meta={}, source=letter.source)
-
-    async def process_alpha_only(self, letter: UserLetter, alpha_signal=None):
+    async def process_letter(self, letter: UserLetter):
         verdict = self.decisions.pop(0)
         return SantaDecision(verdict=verdict, publish=False, meta={}, source=letter.source)
 
@@ -33,9 +29,9 @@ def test_queue_preserves_fifo_order():
         santa = StubSanta(decisions=["first", "second"])
         queue = SantaQueue(santa_agent=santa, result_callback=callback)
         await queue.start()
-        letter = UserLetter(token="A", thesis="", source="community")
+        letter = UserLetter(token="A", thesis="", source="community", user_id="user-A")
         await queue.enqueue_letter(letter)
-        await queue.enqueue_alpha(UserLetter(token="B", thesis="", source="alpha"))
+        await queue.enqueue_letter(UserLetter(token="B", thesis="", source="alpha", user_id="user-B"))
         await queue.join()
         await queue.stop()
 

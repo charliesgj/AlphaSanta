@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
-
-from ..agents import AlphaElf, MacroElf, MicroElf, MoodElf
+from ..agents import MacroElf, MicroElf, MoodElf
 from spoon_ai.chat import ChatBot
 from ..config import get_settings
 from ..orchestrator.elf_runner import ElfRunner
@@ -14,7 +12,7 @@ from ..orchestrator.queue import SantaQueue
 from ..infra.monitoring import HealthMonitor, RateLimiter
 from ..santa import SantaAgent
 from ..schema import UserLetter
-from ..services import DisseminationService, PersistenceService, TurnkeyService
+from ..services import DisseminationService, PersistenceService
 from ..transports import LocalElfTransport, A2AElfTransport
 
 logger = logging.getLogger(__name__)
@@ -24,7 +22,11 @@ class AlphaSantaApplication:
     def __init__(self) -> None:
         self.settings = get_settings()
 
-        llm_config = lambda: ChatBot(llm_provider=self.settings.llm_provider, model_name=self.settings.llm_model)
+        llm_config = lambda: ChatBot(
+            llm_provider=self.settings.llm_provider,
+            model_name=self.settings.llm_model,
+            enable_short_term_memory=False,
+        )
         self.micro_runner = ElfRunner(lambda: MicroElf(llm=llm_config()))
         self.mood_runner = ElfRunner(lambda: MoodElf(llm=llm_config()))
         self.macro_runner = ElfRunner(lambda: MacroElf(llm=llm_config()))
@@ -68,24 +70,21 @@ class AlphaSantaApplication:
             twitter_enabled=self.settings.twitter_enabled,
             telegram_enabled=self.settings.telegram_enabled,
         )
-        self.persistence = PersistenceService(self.settings.database_url)
-        self.turnkey = TurnkeyService(self.settings) if self.settings.turnkey_enabled() else None
+        self.persistence = PersistenceService(self.settings)
 
-        self.alpha_elf = AlphaElf()
         self.santa_agent = SantaAgent(
             elf_transport=self.elf_transport,
             elf_order=self.elf_ids,
             dissemination=self.dissemination,
-            persistence=self.persistence,
-            turnkey_service=self.turnkey,
-            alpha_elf=self.alpha_elf,
         )
 
         self.health_monitor = HealthMonitor()
         self.rate_limiter = RateLimiter(self.settings.rate_limit_per_min)
 
         def _rate_key(task):
-            wallet = task.letter.wallet_address
+            if task.letter.user_id:
+                return task.letter.user_id
+            wallet = (task.letter.metadata or {}).get("wallet_address")
             if wallet:
                 return wallet
             return task.source
@@ -93,6 +92,7 @@ class AlphaSantaApplication:
         self.queue = SantaQueue(
             santa_agent=self.santa_agent,
             maxsize=self.settings.queue_maxsize,
+            result_callback=self._handle_decision,
             health_monitor=self.health_monitor,
             rate_limiter=self.rate_limiter,
             rate_key=_rate_key,
@@ -105,24 +105,25 @@ class AlphaSantaApplication:
             await self.queue.start()
             self._queue_started = True
 
-    async def submit_letter(self, letter: UserLetter, *, alpha_signal: Optional[str] = None) -> None:
+    async def submit_letter(self, letter: UserLetter) -> str:
+        submission_id = await self.persistence.create_submission(letter)
         await self.ensure_queue()
-        await self.queue.enqueue_letter(letter, alpha_signal=alpha_signal)
+        await self.queue.enqueue_letter(
+            letter,
+            metadata={"submission_id": submission_id},
+        )
+        return submission_id
 
-    async def submit_alpha(self, letter: UserLetter, *, alpha_signal: Optional[str] = None) -> None:
-        await self.ensure_queue()
-        await self.queue.enqueue_alpha(letter, alpha_signal=alpha_signal)
-
-    async def run_single_letter(self, letter: UserLetter, *, alpha_signal: Optional[str] = None):
-        return await self.santa_agent.process_letter(letter, alpha_signal=alpha_signal)
+    async def run_single_letter(self, letter: UserLetter):
+        return await self.santa_agent.process_letter(letter)
 
     # Backwards compatibility with earlier API names ---------------------------------
 
-    async def submit_council(self, letter: UserLetter, *, alpha_signal: Optional[str] = None) -> None:
-        await self.submit_letter(letter, alpha_signal=alpha_signal)
+    async def submit_council(self, letter: UserLetter) -> str:
+        return await self.submit_letter(letter)
 
-    async def run_single_council(self, letter: UserLetter, *, alpha_signal: Optional[str] = None):
-        return await self.run_single_letter(letter, alpha_signal=alpha_signal)
+    async def run_single_council(self, letter: UserLetter):
+        return await self.run_single_letter(letter)
 
     async def shutdown(self) -> None:
         if self._queue_started:
@@ -131,3 +132,9 @@ class AlphaSantaApplication:
 
     def health(self):
         return self.health_monitor.snapshot()
+
+    async def _handle_decision(self, task, decision) -> None:
+        submission_id = task.metadata.get("submission_id")
+        if not submission_id:
+            return
+        await self.persistence.finalize_submission(submission_id, task.letter, decision)

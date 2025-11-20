@@ -63,9 +63,14 @@ class MoodElf(ElfAgent):
     def post_process(self, assistant_response: str) -> ElfReport:
         confidence = None
         for line in assistant_response.splitlines():
-            if line.lower().startswith("confidence"):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            stripped = stripped.lstrip("-•* ").strip()
+            lowered = stripped.lower()
+            if lowered.startswith("confidence"):
                 try:
-                    confidence = float(line.split(":")[1].strip())
+                    confidence = float(stripped.split(":", 1)[1].strip())
                 except Exception:
                     confidence = None
         return ElfReport(

@@ -2,12 +2,15 @@
 
 ## Installation
 
+Clone the repo, enter it, and install all dependencies (including Spoon Toolkits/Twitter/Telegram tooling) in one shot:
+
 ```bash
-# Assuming you are inside the repository root
+git clone <repo-url>
+cd AlphaSanta
 pip install -e .
-# Include AgentCard dependencies if you plan to run the HTTP servers
-pip install -e '.[agentcard]'
 ```
+
+> 从 v0.1.0 起，AgentCard/A2A 依赖默认就包含在核心安装里，不再需要额外的可选 extras。
 
 Key environment variables (set in your shell or .env):
 
@@ -23,6 +26,13 @@ export NEOFS_OWNER_ADDRESS=...
 export NEOFS_PRIVATE_KEY_WIF=...
 export NEOFS_CONTAINER_ID=...
 export NEOFS_GATEWAY_URL=...   # optional public link
+
+# Supabase persistence
+export SUPABASE_URL=...
+export SUPABASE_ANON_KEY=...
+export SUPABASE_SERVICE_ROLE_KEY=...  # backend worker requires service role privileges
+# Map each elf/santa identifier to its agents.agent_id UUID
+export ALPHASANTA_AGENT_ID_MAP="micro:uuid,mood:uuid,macro:uuid,santa:uuid"
 
 # Social channels (optional)
 export TWITTER_CONSUMER_KEY=...
@@ -40,7 +50,6 @@ export ALPHASANTA_LLM_PROVIDER=anthropic
 export ALPHASANTA_LLM_MODEL=claude-haiku-4-5-20251001
 export ALPHASANTA_QUEUE_MAXSIZE=0
 export ALPHASANTA_RATE_LIMIT_PER_MIN=60
-export ALPHASANTA_DATABASE_URL=sqlite:///alphasanta.db
 # Switch to remote A2A AgentCards (requires google-a2a SDK)
 export ALPHASANTA_ELF_TRANSPORT=a2a
 export ALPHASANTA_A2A_MICRO_URL=http://localhost:13000
@@ -54,7 +63,7 @@ export ALPHASANTA_A2A_TIMEOUT_SECONDS=45
 Use the direct CLI runner when you want a one-shot evaluation from the command line:
 
 ```bash
-alphasanta-start --token BTC/USDT --thesis "ETF inflows accelerating"
+alphasanta-start --token BTC/USDT --thesis "ETF inflows accelerating" --user-id demo-user
 ```
 
 The script prints each elf's structured report and Santa's final decision. `decision.meta.timeline`
@@ -84,11 +93,41 @@ Each AgentCard expects a JSON payload like:
 {
   "token": "BTC/USDT",
   "thesis": "ETF supply crunch narrative",
+  "user_id": "demo-user-123",
   "source": "community"
 }
 ```
 
 Submit via any AgentCard-compatible client; the response contains the structured `ElfReport` (for elves) or `SantaDecision` (for Santa).
+
+## Task Workflow & Queueing
+
+When integrating with your own backend/API:
+
+1. Collect `token`, `thesis`, and `user_id` from the frontend.
+2. Call `AlphaSantaApplication.submit_letter(UserLetter(...))`; it creates a Supabase `submissions` row with status `pending`, returns the `submission_id`, and enqueues the work.
+3. SantaQueue runs tasks sequentially. For each task Santa plans missions for Micro/Mood/Macro (based on the thesis), gathers their "Elf's response" JSON, averages confidences into `SantaScore`, and emits `pass/not_pass`.
+4. Once all elves plus Santa finish, `submissions` is updated to `completed`, the final JSON (missions, elf responses, Santa decision) is stored in `result`, and one row per agent is written to `submission_agents` (only after Santa finishes, as required for downstream analytics).
+
+Use the returned `submission_id` to show pending entries in the UI and to poll for completion.
+
+For quick manual verification (including Supabase writes), use:
+
+```bash
+python scripts/manual_submit.py --token BTC/USDT --thesis "Momentum building" --user-id demo-user
+```
+
+The script queues a submission, prints the `submission_id`, waits for Santa to finish, and exits once the queue drains.
+
+### Processing pending Submissions from Supabase
+
+If your frontend writes directly into the Supabase `submissions` table, run the long-lived worker so each pending row gets processed:
+
+```bash
+alphasanta-process-submissions --interval 3
+```
+
+The worker polls for `status = pending`, marks it as `processing`, runs Santa, and writes the final payload + `submission_agents` rows. It requires the `SUPABASE_SERVICE_ROLE_KEY` so it can bypass RLS.
 
 ## Testing
 
@@ -106,25 +145,18 @@ These tests focus on payload shapes and orchestration logic. They do not call ex
 2. Enable NeoFS via `--neofs` for Santa (CLI or AgentCard).
 3. On publish decisions, metadata and reports are uploaded. The resulting `object_id` and optional gateway link are stored in the decision payload.
 
-## AlphaElf Always-On Mode
+## Supabase Persistence & User Binding
 
-`AlphaElf` can be wired into automation to keep Santa active when community input is quiet. Provide your proprietary signal when calling Santa via `alphasanta-start --alpha-signal "..."`; Santa treats it as a special source and can publish after a single round of evaluation.
+Every deployment writes submissions and per-agent outputs to the Supabase schema
+(`users`, `agents`, `submissions`, `submission_agents`, `evaluations`). The runner:
 
-## Queue Worker (Optional)
+1. Inserts a pending row into `submissions` as soon as `submit_letter` is called.
+2. Once Santa finishes, the same row is updated with `agent_confidence`, `santa_score`, `santa_decision`,
+   the summarized analysis, and a `result` JSON containing missions, elf responses, and Santa's verdict.
+3. Exactly one row per elf plus Santa is written to `submission_agents` (after completion) using UUIDs from
+   `ALPHASANTA_AGENT_ID_MAP` so downstream analytics can compare each agent to Santa's final call.
 
-Run a dedicated queue that feeds input to Santa sequentially.
-Producers (AgentCards, schedulers, AlphaElf) call the queue helpers exposed via `AlphaSantaApplication`.
-
-```bash
-python -m alphasanta.cli.queue_worker  # future integration point
-```
-
-The queue guarantees FIFO processing; see `alphasanta/orchestrator/queue.py` for
-custom integration hooks (e.g., result callbacks to persist outcomes).
-
-### Wallet binding & Turnkey
-
-- Frontend should associate each submission with a wallet address (and optional user ID).
-- Populate `UserLetter.wallet_address` via the submission payload; it will be persisted alongside elf reports and Santa decisions.
-- When Turnkey credentials (`TURNKEY_*`) are present, use `alphasanta.services.TurnkeyService` to verify signatures or trigger custodial actions.
-- Persistence is handled via SQLite by default (`ALPHASANTA_DATABASE_URL`), but you can point it to a remote database in production.
+- Frontend should associate each submission with a `user_id`. If you still need to attach a wallet, place it inside
+  `UserLetter.metadata["wallet_address"]`.
+- Ensure `.env` (or AWS Secrets on EC2) includes `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and `ALPHASANTA_AGENT_ID_MAP`
+  so every elf/Santa run maps to the correct `agents.agent_id`.

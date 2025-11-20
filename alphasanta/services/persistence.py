@@ -1,168 +1,183 @@
-"""Lightweight persistence layer for AlphaSanta."""
+"""Persistence layer that writes submissions and agent outputs to Supabase."""
 
 from __future__ import annotations
 
 import asyncio
-import json
-import sqlite3
-from dataclasses import asdict
+import logging
+import uuid
 from datetime import datetime
-from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Dict, List
 
-from ..schema import UserLetter, CouncilResult, ElfReport, SantaDecision
+from supabase import Client as SupabaseClient, create_client as create_supabase_client  # type: ignore
 
-_DEFAULT_SQLITE_PATH = Path("alphasanta.db")
+from ..config import Settings
+from ..schema import SantaDecision, UserLetter
+
+logger = logging.getLogger(__name__)
 
 
 class PersistenceService:
-    """Stores submissions, elf reports, and Santa decisions."""
+    """Stores submission states plus per-agent outputs."""
 
-    def __init__(self, database_url: str) -> None:
-        if database_url.startswith("sqlite:///"):
-            self._path = Path(database_url.replace("sqlite:///", "", 1))
-        else:
-            raise ValueError("Only sqlite:/// URLs are supported in the reference implementation.")
-        self._ensure_schema()
+    def __init__(self, settings: Settings) -> None:
+        if not settings.supabase_enabled():
+            raise RuntimeError("Supabase is not configured. Set SUPABASE_URL and SUPABASE_ANON_KEY.")
+        self._client: SupabaseClient = create_supabase_client(settings.supabase_url, settings.supabase_key)
+        self._agent_id_map: Dict[str, str] = {k.lower(): v for k, v in (settings.agent_id_map or {}).items()}
 
-    def _ensure_schema(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._path) as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS submissions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    token TEXT,
-                    thesis TEXT,
-                    source TEXT,
-                    wallet_address TEXT,
-                    user_id TEXT,
-                    metadata TEXT,
-                    created_at TEXT
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS elf_reports (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    submission_id INTEGER,
-                    elf_id TEXT,
-                    analysis TEXT,
-                    confidence REAL,
-                    rationale TEXT,
-                    evidence TEXT,
-                    meta TEXT,
-                    FOREIGN KEY(submission_id) REFERENCES submissions(id)
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS santa_decisions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    submission_id INTEGER,
-                    verdict TEXT,
-                    publish INTEGER,
-                    confidence REAL,
-                    rationale TEXT,
-                    neofs_object_id TEXT,
-                    neofs_link TEXT,
-                    meta TEXT,
-                    source TEXT,
-                    created_at TEXT,
-                    FOREIGN KEY(submission_id) REFERENCES submissions(id)
-                )
-                """
-            )
+    async def create_submission(self, letter: UserLetter) -> str:
+        return await asyncio.to_thread(self._create_submission_sync, letter)
 
-    async def record_council_and_decision(
+    async def finalize_submission(
         self,
-        council_result: CouncilResult,
-        decision: SantaDecision,
-    ) -> None:
-        await asyncio.to_thread(self._record_council_and_decision, council_result, decision)
-
-    async def record_alpha_decision(
-        self,
+        submission_id: str,
         letter: UserLetter,
         decision: SantaDecision,
     ) -> None:
-        await asyncio.to_thread(self._record_alpha_decision, letter, decision)
+        await asyncio.to_thread(self._finalize_submission_sync, submission_id, letter, decision)
 
-    # ------- internal synchronous helpers -------
+    # ------------------------------------------------------------------
+    # Internal helpers (sync, executed via to_thread)
+    # ------------------------------------------------------------------
 
-    def _record_council_and_decision(self, council_result: CouncilResult, decision: SantaDecision) -> None:
-        with sqlite3.connect(self._path) as conn:
-            cursor = conn.cursor()
-            submission_id = self._insert_submission(cursor, council_result.user_letter)
-            for report in council_result.reports:
-                self._insert_report(cursor, submission_id, report)
-            self._insert_decision(cursor, submission_id, decision)
-            conn.commit()
+    def _create_submission_sync(self, letter: UserLetter) -> str:
+        submission_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+        payload = {
+            "submission_id": submission_id,
+            "user_id": letter.user_id,
+            "token_pair": letter.token,
+            "thesis": letter.thesis,
+            "status": "pending",
+            "agent_confidence": None,
+            "santa_score": None,
+            "santa_decision": None,
+            "result": {
+                "source": letter.source,
+                "metadata": letter.metadata or {},
+            },
+            "created_at": now,
+            "updated_at": now,
+        }
+        self._client.table("submissions").insert(payload).execute()
+        return submission_id
 
-    def _record_alpha_decision(self, letter: UserLetter, decision: SantaDecision) -> None:
-        with sqlite3.connect(self._path) as conn:
-            cursor = conn.cursor()
-            submission_id = self._insert_submission(cursor, letter)
-            self._insert_decision(cursor, submission_id, decision)
-            conn.commit()
+    def _finalize_submission_sync(
+        self,
+        submission_id: str,
+        letter: UserLetter,
+        decision: SantaDecision,
+    ) -> None:
+        result_payload: Dict[str, Any] = getattr(decision, "_result_payload", {}) or {}
+        meta = decision.meta or {}
+        if not result_payload:
+            fallback_decision = {
+                "verdict": "pass" if decision.publish else "not_pass",
+                "publish": decision.publish,
+                "santa_score": int(float(decision.confidence or 0) * 100) if decision.confidence is not None else None,
+                "agent_confidence": decision.confidence,
+                "rationale": decision.rationale,
+                "confidence": decision.confidence,
+            }
+            metadata_block = {
+                "user_id": letter.user_id,
+                "source": letter.source,
+                "submission_id": submission_id,
+            }
+            if letter.metadata:
+                metadata_block["extra"] = letter.metadata
+            result_payload = {
+                "token": letter.token,
+                "thesis": letter.thesis,
+                "source": letter.source,
+                "missions": [],
+                "agents": [],
+                "decision": fallback_decision,
+                "timeline": meta.get("timeline", []),
+                "metadata": metadata_block,
+            }
+        result_payload.setdefault("token", letter.token)
+        result_payload.setdefault("thesis", letter.thesis)
+        result_payload.setdefault("source", letter.source)
+        metadata_block = result_payload.get("metadata")
+        if not isinstance(metadata_block, dict):
+            metadata_block = {}
+        metadata_block.setdefault("user_id", letter.user_id)
+        metadata_block.setdefault("source", letter.source)
+        if letter.metadata:
+            metadata_block.setdefault("extra", letter.metadata)
+        metadata_block["submission_id"] = submission_id
+        result_payload["metadata"] = metadata_block
 
-    # ------- insert helpers -------
+        decision_block = result_payload.get("decision", {}) or {}
+        avg_confidence = decision_block.get("agent_confidence")
+        santa_score = decision_block.get("santa_score")
+        santa_decision = decision_block.get("verdict") or ("pass" if decision.publish else "not_pass")
+        if santa_score is None and isinstance(decision.confidence, (int, float)):
+            santa_score = int(float(decision.confidence) * 100)
 
-    def _insert_submission(self, cursor: sqlite3.Cursor, letter: UserLetter) -> int:
-        cursor.execute(
-            """
-            INSERT INTO submissions (token, thesis, source, wallet_address, user_id, metadata, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                letter.token,
-                letter.thesis,
-                letter.source,
-                letter.wallet_address,
-                letter.user_id,
-                json.dumps(letter.metadata, ensure_ascii=False),
-                datetime.utcnow().isoformat(),
-            ),
-        )
-        return int(cursor.lastrowid)
+        update_payload = {
+            "status": "completed",
+            "agent_confidence": avg_confidence,
+            "santa_score": santa_score,
+            "santa_decision": santa_decision,
+            "result": result_payload,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        self._client.table("submissions").update(update_payload).eq("submission_id", submission_id).execute()
 
-    def _insert_report(self, cursor: sqlite3.Cursor, submission_id: int, report: ElfReport) -> None:
-        cursor.execute(
-            """
-            INSERT INTO elf_reports (submission_id, elf_id, analysis, confidence, rationale, evidence, meta)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                submission_id,
-                report.elf_id,
-                report.analysis,
-                report.confidence,
-                report.rationale,
-                json.dumps(report.evidence, ensure_ascii=False),
-                json.dumps(report.meta, ensure_ascii=False),
-            ),
-        )
+        agents = list(result_payload.get("agents") or [])
+        self._insert_agent_rows(submission_id, agents, santa_score, santa_decision)
+        self._insert_santa_row(submission_id, decision, santa_score, santa_decision)
 
-    def _insert_decision(self, cursor: sqlite3.Cursor, submission_id: int, decision: SantaDecision) -> None:
-        cursor.execute(
-            """
-            INSERT INTO santa_decisions (
-                submission_id, verdict, publish, confidence, rationale,
-                neofs_object_id, neofs_link, meta, source, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                submission_id,
-                decision.verdict,
-                int(decision.publish),
-                decision.confidence,
-                decision.rationale,
-                decision.neofs_object_id,
-                decision.neofs_link,
-                json.dumps(decision.meta, ensure_ascii=False),
-                decision.source,
-                datetime.utcnow().isoformat(),
-            ),
-        )
+    # ------------------------------------------------------------------
+    # Row builders
+    # ------------------------------------------------------------------
+
+    def _insert_agent_rows(
+        self,
+        submission_id: str,
+        agents: List[Dict[str, Any]],
+        santa_score: Any,
+        santa_decision: Any,
+    ) -> None:
+        for agent in agents:
+            elf_id = str(agent.get("elf_id", "")).lower()
+            agent_id = self._agent_id_map.get(elf_id)
+            if not agent_id:
+                logger.warning("No agent_id configured for elf_id=%s; skipping submission_agents insert.", elf_id)
+                continue
+            summary = agent.get("summary") or {}
+            record = {
+                "id": str(uuid.uuid4()),
+                "submission_id": submission_id,
+                "agent_id": agent_id,
+                "agent_confidence": summary.get("confidence"),
+                "santa_score": santa_score,
+                "santa_decision": santa_decision,
+                "agent_output": agent,
+                "processed_at": datetime.utcnow().isoformat(),
+            }
+            self._client.table("submission_agents").insert(record).execute()
+
+    def _insert_santa_row(
+        self,
+        submission_id: str,
+        decision: SantaDecision,
+        santa_score: Any,
+        santa_decision: Any,
+    ) -> None:
+        santa_agent_id = self._agent_id_map.get("santa")
+        if not santa_agent_id:
+            return
+        record = {
+            "id": str(uuid.uuid4()),
+            "submission_id": submission_id,
+            "agent_id": santa_agent_id,
+            "agent_confidence": decision.confidence,
+            "santa_score": santa_score,
+            "santa_decision": santa_decision,
+            "agent_output": decision.to_dict(),
+            "processed_at": datetime.utcnow().isoformat(),
+        }
+        self._client.table("submission_agents").insert(record).execute()

@@ -7,7 +7,7 @@ from typing import Any
 __all__ = [
     "DisseminationService",
     "PersistenceService",
-    "TurnkeyService",
+    "SubmissionWorker",
 ]
 
 
@@ -20,8 +20,8 @@ def __getattr__(name: str) -> Any:  # pragma: no cover
         from .persistence import PersistenceService
 
         return PersistenceService
-    if name == "TurnkeyService":
-        from .turnkey_service import TurnkeyService
+    if name == "SubmissionWorker":
+        from .submission_worker import SubmissionWorker
 
-        return TurnkeyService
+        return SubmissionWorker
     raise AttributeError(name)

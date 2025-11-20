@@ -22,7 +22,7 @@ try:
     from a2a.types import AgentCapabilities, AgentCard, AgentSkill, Part, TextPart
 except ImportError as exc:  # pragma: no cover - optional dependency
     raise RuntimeError(
-        "google-a2a SDK not installed. Install with `pip install '.[agentcard]'`."
+        "google-a2a SDK not installed. Ensure `pip install -e .` succeeded or install `google-a2a`."
     ) from exc
 
 logger = logging.getLogger(__name__)
@@ -168,11 +168,21 @@ def parse_context_as_user_letter(context: RequestContext) -> UserLetter:
 
     token = payload.get("token")
     thesis = payload.get("thesis")
+    user_id = payload.get("user_id")
     if not token or not thesis:
         raise ValueError("Payload must include 'token' and 'thesis'.")
+    if not user_id:
+        raise ValueError("Payload must include 'user_id'.")
 
     source = payload.get("source", "community")
-    return UserLetter(token=token, thesis=thesis, source=source)
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    wallet_address = payload.get("wallet_address")
+    if wallet_address:
+        metadata = dict(metadata)
+        metadata.setdefault("wallet_address", wallet_address)
+    return UserLetter(token=token, thesis=thesis, source=source, user_id=user_id, metadata=metadata)
 
 
 async def _maybe_await(result):

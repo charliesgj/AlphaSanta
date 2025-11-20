@@ -19,6 +19,13 @@ def test_elf_report_payload_and_brief():
     assert "MICRO" in brief
     assert "0.72" in brief
 
+    mission = "Analyze BTC micro structure"
+    response_payload = report.to_response_payload(mission)
+    assert response_payload["elf_id"] == "micro"
+    assert response_payload["mission"] == mission
+    assert response_payload["confidence_score"] == 0.72
+    assert response_payload["formatted"].startswith("Micro Elf's insight")
+
 
 def test_santa_decision_serialization():
     decision = SantaDecision(

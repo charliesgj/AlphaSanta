@@ -14,24 +14,21 @@ async def run_workflow(
     *,
     token: str,
     thesis: str,
-    alpha_signal: str | None,
-    wallet: str | None,
     user_id: str | None,
 ) -> None:
     app = AlphaSantaApplication()
     letter = UserLetter(
         token=token,
         thesis=thesis,
-        wallet_address=wallet,
         user_id=user_id,
         metadata={},
     )
-    decision = await app.run_single_letter(letter, alpha_signal=alpha_signal)
-    elf_reports = decision.meta.get("elf_reports", [])
+    decision = await app.run_single_letter(letter)
+    elf_responses = decision.meta.get("elf_responses", [])
 
-    print("\n=== Elf Reports ===")
-    for report in elf_reports:
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+    print("\n=== Elf Responses ===")
+    for response in elf_responses:
+        print(json.dumps(response, ensure_ascii=False, indent=2))
 
     print("\n=== Santa Decision ===")
     print(json.dumps(decision.to_dict(), ensure_ascii=False, indent=2))
@@ -42,22 +39,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Start the AlphaSanta letter-to-decision workflow.")
     parser.add_argument("--token", help="Token symbol (e.g., BTC/USDT).")
     parser.add_argument("--thesis", help="Community thesis or signal description.")
-    parser.add_argument("--wallet", help="Wallet address to bind the submission.")
-    parser.add_argument("--user-id", help="Optional user identifier.")
-    parser.add_argument("--alpha-signal", help="Optional proprietary alpha signal to feed AlphaElf.")
+    parser.add_argument("--user-id", help="User identifier (required).")
     args = parser.parse_args()
 
     token = args.token or input("Token symbol (e.g., BTC/USDT): ").strip()
     thesis = args.thesis or input("Thesis / idea: ").strip()
-    wallet = args.wallet or input("Wallet address (optional): ").strip() or None
     user_id = args.user_id or None
+    while not user_id:
+        user_id = input("User ID (required): ").strip()
 
     asyncio.run(
         run_workflow(
             token=token,
             thesis=thesis,
-            alpha_signal=args.alpha_signal,
-            wallet=wallet,
             user_id=user_id,
         )
     )

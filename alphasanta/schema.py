@@ -5,7 +5,6 @@ Shared data structures for AlphaSanta agents.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 
@@ -45,6 +44,29 @@ class ElfReport:
             payload["rationale"] = self.rationale
         return payload
 
+    def to_response_payload(self, mission: str | None = None) -> Dict[str, Any]:
+        """Produce the canonical Elf's response JSON."""
+        confidence = None
+        if isinstance(self.confidence, (int, float)):
+            confidence = float(self.confidence)
+
+        formatted_insight = self.analysis.strip()
+        formatted = f"{self.elf_id.title()}Elf insight: {formatted_insight}"
+
+        return {
+            "summary": {
+                "insight": formatted_insight,
+                "formatted": formatted,
+                "confidence": confidence,
+            },
+            "report": {
+                "analysis": self.analysis,
+                "evidence": self.evidence,
+                "meta": self.meta,
+                "confidence": confidence,
+            },
+        }
+
     def brief(self) -> str:
         """Return a one-line summary for Santa."""
         confidence_txt = (
@@ -80,22 +102,9 @@ class UserLetter:
 
     token: str
     thesis: str
-    wallet_address: Optional[str] = None
-    user_id: Optional[str] = None
+    user_id: str
     source: str = "community"  # community, alpha, automation, etc.
     metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class CouncilResult:
-    """
-    Result of running the elf council.
-    """
-
-    user_letter: UserLetter
-    reports: List[ElfReport]
-    summary: str
-    created_at: datetime = field(default_factory=lambda: datetime.utcnow())
 
 
 @dataclass

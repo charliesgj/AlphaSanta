@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Optional
+from typing import Dict
 
 from dotenv import load_dotenv
 
@@ -33,6 +33,26 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _parse_agent_id_map(raw: str) -> Dict[str, str]:
+    """
+    Parse ALPHASANTA_AGENT_ID_MAP env values such as:
+    micro:uuid1,mood:uuid2,macro:uuid3,santa:uuid4
+    """
+    mapping: Dict[str, str] = {}
+    if not raw:
+        return mapping
+    for part in raw.split(","):
+        piece = part.strip()
+        if not piece or ":" not in piece:
+            continue
+        key, value = piece.split(":", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if key and value:
+            mapping[key] = value
+    return mapping
+
+
 @dataclass(frozen=True)
 class Settings:
     llm_provider: str = os.getenv("ALPHASANTA_LLM_PROVIDER", "anthropic")
@@ -44,18 +64,15 @@ class Settings:
     neofs_container_id: str = os.getenv("NEOFS_CONTAINER_ID", "")
     neofs_gateway_url: str = os.getenv("NEOFS_GATEWAY_URL", "")
 
-    twitter_enabled: bool = _env_bool("ALPHASANTA_TWITTER_ENABLED", False)
-    telegram_enabled: bool = _env_bool("ALPHASANTA_TELEGRAM_ENABLED", False)
+    twitter_enabled: bool = _env_bool("ALPHASANTA_TWITTER_ENABLED", True)
+    telegram_enabled: bool = _env_bool("ALPHASANTA_TELEGRAM_ENABLED", True)
 
-    database_url: str = os.getenv("ALPHASANTA_DATABASE_URL", "sqlite:///alphasanta.db")
+    supabase_url: str = os.getenv("SUPABASE_URL", "")
+    supabase_key: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY", "")
+    agent_id_map: Dict[str, str] = field(default_factory=lambda: _parse_agent_id_map(os.getenv("ALPHASANTA_AGENT_ID_MAP", "")))
 
     queue_maxsize: int = _env_int("ALPHASANTA_QUEUE_MAXSIZE", 0)
     rate_limit_per_min: int = _env_int("ALPHASANTA_RATE_LIMIT_PER_MIN", 60)
-
-    turnkey_base_url: str = os.getenv("TURNKEY_BASE_URL", "")
-    turnkey_public_key: str = os.getenv("TURNKEY_API_PUBLIC_KEY", "")
-    turnkey_private_key: str = os.getenv("TURNKEY_API_PRIVATE_KEY", "")
-    turnkey_org_id: str = os.getenv("TURNKEY_ORG_ID", "")
 
     elf_transport: str = os.getenv("ALPHASANTA_ELF_TRANSPORT", "local").lower()
     a2a_micro_url: str = os.getenv("ALPHASANTA_A2A_MICRO_URL", "")
@@ -63,8 +80,8 @@ class Settings:
     a2a_macro_url: str = os.getenv("ALPHASANTA_A2A_MACRO_URL", "")
     a2a_timeout: float = _env_float("ALPHASANTA_A2A_TIMEOUT_SECONDS", 45.0)
 
-    def turnkey_enabled(self) -> bool:
-        return all([self.turnkey_base_url, self.turnkey_public_key, self.turnkey_private_key, self.turnkey_org_id])
+    def supabase_enabled(self) -> bool:
+        return bool(self.supabase_url and self.supabase_key)
 
 
 @lru_cache(maxsize=1)

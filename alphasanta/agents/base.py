@@ -44,7 +44,12 @@ class ElfAgent(ToolCallAgent, ABC):
         avaliable_tools = ToolManager(list(tools) if tools else list(self.build_tools()))
 
         super().__init__(
-            llm=llm or ChatBot(llm_provider=self.llm_provider, model_name=self.llm_model),
+            llm=llm
+            or ChatBot(
+                llm_provider=self.llm_provider,
+                model_name=self.llm_model,
+                enable_short_term_memory=False,
+            ),
             avaliable_tools=avaliable_tools,
             max_steps=max_steps,
         )
@@ -56,11 +61,11 @@ class ElfAgent(ToolCallAgent, ABC):
         self._context = letter
         self.configure_tools(letter)
 
-    async def analyze(self, token: str, thesis: str) -> ElfReport:
+    async def analyze(self, token: str, thesis: str, user_id: str = "elf-runner") -> ElfReport:
         """
         Execute the elf's reasoning loop and return a structured report.
         """
-        letter = UserLetter(token=token, thesis=thesis)
+        letter = UserLetter(token=token, thesis=thesis, user_id=user_id)
         return await self.analyze_input(letter)
 
     async def analyze_input(self, letter: UserLetter) -> ElfReport:
@@ -114,12 +119,12 @@ class ElfAgent(ToolCallAgent, ABC):
 
     # Utility -------------------------------------------------------------------
 
-    async def stream_analysis(self, token: str, thesis: str) -> ElfReport:
+    async def stream_analysis(self, token: str, thesis: str, user_id: str = "elf-runner") -> ElfReport:
         """
         Convenience wrapper to run analyze() ensuring cleanup.
         """
         try:
-            letter = UserLetter(token=token, thesis=thesis)
+            letter = UserLetter(token=token, thesis=thesis, user_id=user_id)
             return await self.analyze_input(letter)
         finally:
             await self._cleanup()

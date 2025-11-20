@@ -17,8 +17,6 @@ class SantaTask:
     """Represents one pending decision for Santa."""
 
     letter: UserLetter
-    alpha_signal: Optional[str] = None
-    mode: str = "letter"  # "letter" (full council) or "alpha_only"
     metadata: dict = field(default_factory=dict)
 
     @property
@@ -55,30 +53,11 @@ class SantaQueue:
         self,
         letter: UserLetter,
         *,
-        alpha_signal: Optional[str] = None,
         metadata: Optional[dict] = None,
     ) -> None:
         await self._enqueue(
             SantaTask(
                 letter=letter,
-                alpha_signal=alpha_signal,
-                mode="letter",
-                metadata=metadata or {},
-            )
-        )
-
-    async def enqueue_alpha(
-        self,
-        letter: UserLetter,
-        *,
-        alpha_signal: Optional[str] = None,
-        metadata: Optional[dict] = None,
-    ) -> None:
-        await self._enqueue(
-            SantaTask(
-                letter=letter,
-                alpha_signal=alpha_signal,
-                mode="alpha_only",
                 metadata=metadata or {},
             )
         )
@@ -111,16 +90,7 @@ class SantaQueue:
             while not self._stop_event.is_set():
                 task = await self._queue.get()
                 try:
-                    if task.mode == "alpha_only":
-                        decision = await self._santa.process_alpha_only(
-                            task.letter,
-                            alpha_signal=task.alpha_signal,
-                        )
-                    else:
-                        decision = await self._santa.process_letter(
-                            task.letter,
-                            alpha_signal=task.alpha_signal,
-                        )
+                    decision = await self._santa.process_letter(task.letter)
 
                     if self._health_monitor:
                         self._health_monitor.record_success()

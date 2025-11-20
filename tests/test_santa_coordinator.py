@@ -31,7 +31,7 @@ def test_local_transport_runs_elves():
         "mood": ElfRunner(lambda: StubElf("mood", "neutral", 0.6)),  # type: ignore[arg-type]
     }
     transport = LocalElfTransport(runners)
-    letter = UserLetter(token="BTC/USDT", thesis="ETF narrative")
+    letter = UserLetter(token="BTC/USDT", thesis="ETF narrative", user_id="test-user")
     tracer = WorkflowTracer()
 
     async def gather_reports():

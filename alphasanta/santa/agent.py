@@ -1,11 +1,12 @@
 """
-SantaAgent – final decision-maker that consumes elf reports.
+SantaAgent – orchestrates missions for elves and finalizes decisions.
 """
 
 from __future__ import annotations
 
-import asyncio
-from typing import List, Optional, Sequence
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence
+from uuid import uuid4
 
 from pydantic import ConfigDict
 
@@ -13,192 +14,314 @@ from spoon_ai.agents.toolcall import ToolCallAgent
 from spoon_ai.chat import ChatBot
 from spoon_ai.tools import ToolManager
 
-from ..agents.alpha import AlphaElf
-from ..schema import UserLetter, CouncilResult, ElfReport, SantaDecision
-from ..services import DisseminationService, PersistenceService, TurnkeyService
+from ..schema import ElfReport, SantaDecision, UserLetter
+from ..services import DisseminationService
 from ..transports import ElfTransport
 from .tracing import WorkflowTracer
+
+
 class SantaAgent(ToolCallAgent):
-    """
-    Santa digests reports, requests clarifications, and publishes final verdicts.
-    """
+    """Plan missions for elves, aggregate their insights, and score each submission."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
 
     name: str = "SantaAgent"
-    description: str = "Jolly arbiter synthesizing elf intel into alpha gifts."
-    system_prompt: str = (
-        "You are Santa, the benevolent but discerning leader of AlphaSanta.\n"
-        "You receive analyses from MicroElf (technical), MoodElf (sentiment), "
-        "MacroElf (macro trends), and optionally AlphaElf (proprietary scouts).\n"
-        "Your job is to:\n"
-        "1. Synthesize their perspectives into a cohesive verdict.\n"
-        "2. Assign a final confidence score [0-1].\n"
-        "3. Decide whether the community should receive this alpha (Publish: yes/no).\n"
-        "4. Provide a playful but professional summary referencing each elf.\n"
-        "\n"
-        "Output format (strict):\n"
-        "Verdict: <one sentence>\n"
-        "Confidence: <float>\n"
-        "Publish: <yes/no>\n"
-        "Rationale:\n"
-        "- point 1\n"
-        "- point 2\n"
-    )
+    description: str = "Planner and judge synthesizing Micro/Mood/Macro intel into a ruling."
+    system_prompt: str = ""
+
+    publish_threshold: int = 60
+    _macro_keywords = [
+        "macro",
+        "fed",
+        "inflation",
+        "cpi",
+        "gdp",
+        "policy",
+        "regulation",
+        "interest",
+        "rate",
+        "economy",
+    ]
+    _mood_keywords = [
+        "sentiment",
+        "community",
+        "social",
+        "buzz",
+        "hype",
+        "narrative",
+        "fear",
+        "greed",
+    ]
+    _mission_focus: Dict[str, str] = {
+        "micro": "Focus on short-term technical structure, price/volume signals, and momentum shifts.",
+        "macro": "Evaluate macro catalysts, regulatory backdrops, and liquidity conditions influencing the token.",
+        "mood": "Gauge community narratives, influential voices, and sentiment swings across social/news feeds.",
+    }
 
     def __init__(
         self,
         *,
         dissemination: DisseminationService,
-        persistence: PersistenceService,
         elf_transport: ElfTransport,
         elf_order: Optional[Sequence[str]] = None,
-        turnkey_service: Optional[TurnkeyService] = None,
-        alpha_elf: Optional[AlphaElf] = None,
         llm: Optional[ChatBot] = None,
     ) -> None:
         super().__init__(
-            llm=llm or ChatBot(llm_provider="anthropic", model_name="claude-haiku-4-5-20251001"),
+            llm=llm
+            or ChatBot(
+                llm_provider="anthropic",
+                model_name="claude-haiku-4-5-20251001",
+                enable_short_term_memory=False,
+            ),
             avaliable_tools=ToolManager([]),
-            max_steps=4,
+            max_steps=1,
         )
         object.__setattr__(self, "dissemination", dissemination)
-        object.__setattr__(self, "persistence", persistence)
-        object.__setattr__(self, "turnkey_service", turnkey_service)
-        object.__setattr__(self, "alpha_elf", alpha_elf)
         object.__setattr__(self, "elf_transport", elf_transport)
         elf_ids = tuple(elf_order or getattr(elf_transport, "elf_ids", ()))
+        if not elf_ids:
+            elf_ids = ("micro", "mood", "macro")
         object.__setattr__(self, "elf_ids", elf_ids)
 
-    async def process_letter(
-        self,
-        letter: UserLetter,
-        *,
-        alpha_signal: Optional[str] = None,
-    ) -> SantaDecision:
-        """
-        Primary workflow: receive a UserLetter, dispatch elves, and synthesize Santa's verdict.
-        """
+    async def process_letter(self, letter: UserLetter) -> SantaDecision:
         tracer = WorkflowTracer()
-        tracer.emit("letter.received", "start", detail=f"token={letter.token}")
+        tracer.emit("task.received", "start")
 
-        reports = await self._gather_reports(letter, tracer)
+        missions = self._assemble_missions(letter)
+        reports = await self._dispatch_missions(letter, missions, tracer)
+        agents = self._assemble_agent_results(missions, reports, tracer)
 
-        if alpha_signal and self.alpha_elf:
-            tracer.emit("alpha.dispatch", "start", detail="alpha_signal_attached")
-            try:
-                alpha_report = await self.alpha_elf.from_signal(
-                    token=letter.token,
-                    thesis=letter.thesis,
-                    signal_payload=alpha_signal,
-                )
-            except Exception as exc:  # pragma: no cover - defensive
-                tracer.emit("alpha.dispatch", "error", detail=str(exc))
-                raise
-            tracer.emit(
-                "alpha.dispatch",
-                "success",
-                detail=f"confidence={alpha_report.confidence}" if alpha_report.confidence is not None else None,
-            )
-            reports.append(alpha_report)
+        avg_confidence = self._average_confidence(agents)
+        santa_score = int(round(avg_confidence * 100))
 
-        council_result = CouncilResult(
-            user_letter=letter,
-            reports=reports,
-            summary=self._summarize_reports(reports),
-        )
-
-        tracer.emit("santa.synthesizing", "start")
-        decision = await self._llm_decide(letter, reports)
-        decision.source = letter.source
+        decision, decision_payload = self._generate_decision(letter, avg_confidence, santa_score, agents)
         await self._finalize_decision(letter, reports, decision)
-        decision.meta.setdefault("timeline", tracer.serialize())
-        decision.meta.setdefault("council_summary", council_result.summary)
-        await self.persistence.record_council_and_decision(council_result, decision)
-        tracer.emit("santa.synthesizing", "success", detail=decision.verdict)
+
+        tracer.emit("task.completed", "success")
+        global_timeline = self._build_global_timeline(missions)
+        decision.meta.setdefault("timeline", global_timeline)
+        metadata_block: Dict[str, Any] = {
+            "user_id": letter.user_id,
+            "source": letter.source,
+        }
+        if letter.metadata:
+            metadata_block["extra"] = letter.metadata
+            submission_ref = letter.metadata.get("submission_id")
+            if submission_ref:
+                metadata_block["submission_id"] = submission_ref
+        result_payload = {
+            "token": letter.token,
+            "thesis": letter.thesis,
+            "source": letter.source,
+            "missions": missions,
+            "agents": agents,
+            "decision": decision_payload,
+            "timeline": global_timeline,
+            "metadata": metadata_block,
+        }
+        setattr(decision, "_result_payload", result_payload)
         return decision
 
-    async def process_alpha_only(
+    def _assemble_missions(self, letter: UserLetter) -> List[Dict[str, Any]]:
+        missions: List[Dict[str, Any]] = []
+        for elf_id in self._select_elves(letter):
+            mission_text = self._render_mission(letter, elf_id)
+            missions.append(
+                {
+                    "mission_id": str(uuid4()),
+                    "elf_id": elf_id,
+                    "mission_text": mission_text,
+                    "created_at": None,
+                    "dispatched_at": None,
+                    "completed_at": None,
+                    "status": "pending",
+                }
+            )
+        return missions
+
+    async def _dispatch_missions(
         self,
         letter: UserLetter,
-        *,
-        alpha_signal: Optional[str] = None,
-    ) -> SantaDecision:
-        """
-        Handle AlphaElf-only submissions, bypassing the standard elf council.
-        """
-        tracer = WorkflowTracer()
-        tracer.emit("letter.received", "start", detail=f"token={letter.token}")
-
+        missions: List[Dict[str, Any]],
+        tracer: WorkflowTracer,
+    ) -> List[ElfReport]:
         reports: List[ElfReport] = []
-        if alpha_signal and self.alpha_elf:
-            tracer.emit("alpha.dispatch", "start", detail="alpha_signal_attached")
+        for mission in missions:
+            elf_id = mission["elf_id"]
+            mission_id = mission["mission_id"]
+            mission_letter = self._mission_letter(letter, mission)
+            created_event = tracer.emit(
+                "mission.created",
+                "start",
+                detail=None,
+                mission_id=mission_id,
+                elf_id=elf_id,
+            )
+            mission["created_at"] = created_event.timestamp.isoformat()
+            dispatch_event = tracer.emit(
+                "mission.dispatched",
+                "start",
+                detail=None,
+                mission_id=mission_id,
+                elf_id=elf_id,
+            )
+            mission["dispatched_at"] = dispatch_event.timestamp.isoformat()
+            mission["status"] = "running"
             try:
-                alpha_report = await self.alpha_elf.from_signal(
-                    token=letter.token,
-                    thesis=letter.thesis,
-                    signal_payload=alpha_signal,
+                report = await self.elf_transport.fetch_report(elf_id, mission_letter, tracer)
+            except Exception:
+                failure_event = tracer.emit(
+                    "agent.completed",
+                    "failure",
+                    detail=None,
+                    mission_id=mission_id,
+                    elf_id=elf_id,
                 )
-            except Exception as exc:  # pragma: no cover - defensive
-                tracer.emit("alpha.dispatch", "error", detail=str(exc))
+                mission["completed_at"] = failure_event.timestamp.isoformat()
+                mission["status"] = "failed"
                 raise
-            tracer.emit(
-                "alpha.dispatch",
+            completion_event = tracer.emit(
+                "agent.completed",
                 "success",
-                detail=f"confidence={alpha_report.confidence}" if alpha_report.confidence is not None else None,
+                detail=None,
+                mission_id=mission_id,
+                elf_id=elf_id,
             )
-            reports.append(alpha_report)
-
-        if not reports:
-            tracer.emit("alpha.dispatch", "start", detail="alpha_placeholder")
-            reports.append(
-                ElfReport(
-                    elf_id="alpha",
-                    analysis=letter.thesis,
-                    confidence=None,
-                    meta={"token": letter.token, "source": letter.source},
-                )
-            )
-            tracer.emit("alpha.dispatch", "success", detail="placeholder_generated")
-
-        tracer.emit("santa.synthesizing", "start")
-        decision = await self._llm_decide(letter, reports)
-        decision.source = letter.source
-        await self._finalize_decision(letter, reports, decision)
-        decision.meta.setdefault("timeline", tracer.serialize())
-        await self.persistence.record_alpha_decision(letter, decision)
-        tracer.emit("santa.synthesizing", "success", detail=decision.verdict)
-        return decision
-
-    async def _gather_reports(self, letter: UserLetter, tracer: WorkflowTracer) -> List[ElfReport]:
-        if not self.elf_ids:
-            tracer.emit("elves.dispatch_all", "success", detail="no_elves_configured")
-            return []
-
-        tracer.emit("elves.dispatch_all", "start", detail=",".join(self.elf_ids))
-        reports: List[ElfReport] = []
-        for elf_id in self.elf_ids:
-            tracer.emit(f"{elf_id}.dispatch", "start")
-            try:
-                report = await self.elf_transport.fetch_report(elf_id, letter, tracer)
-            except Exception as exc:
-                tracer.emit(f"{elf_id}.dispatch", "error", detail=str(exc))
-                tracer.emit("elves.dispatch_all", "error", detail=str(exc))
-                raise
-            tracer.emit(
-                f"{elf_id}.dispatch",
-                "success",
-                detail=report.brief() if hasattr(report, "brief") else None,
-            )
+            mission["completed_at"] = completion_event.timestamp.isoformat()
+            mission["status"] = "completed"
             reports.append(report)
-
-        tracer.emit("elves.dispatch_all", "success", detail=",".join(report.elf_id for report in reports))
         return reports
 
-    @staticmethod
-    def _summarize_reports(reports: Sequence[ElfReport]) -> str:
-        lines = [report.brief() for report in reports]
+    def _mission_letter(self, letter: UserLetter, mission: Dict[str, Any]) -> UserLetter:
+        metadata = dict(letter.metadata or {})
+        metadata.update(
+            {
+                "original_thesis": letter.thesis,
+                "santa_mission": mission["mission_text"]["text"],
+                "elf_id": mission["elf_id"],
+                "mission_id": mission["mission_id"],
+            }
+        )
+        return UserLetter(
+            token=letter.token,
+            thesis=mission["mission_text"]["text"],
+            user_id=letter.user_id,
+            source=letter.source,
+            metadata=metadata,
+        )
+
+    def _select_elves(self, letter: UserLetter) -> Sequence[str]:
+        thesis = (letter.thesis or "").lower()
+        selected: List[str] = ["micro"]
+        if any(keyword in thesis for keyword in self._macro_keywords):
+            selected.append("macro")
+        if any(keyword in thesis for keyword in self._mood_keywords):
+            selected.append("mood")
+        if len(thesis) > 320 and "macro" not in selected:
+            selected.append("macro")
+        if "community" in thesis or "narrative" in thesis:
+            selected.append("mood")
+        deduped = []
+        for elf_id in selected:
+            if elf_id not in deduped:
+                deduped.append(elf_id)
+        return tuple(deduped)
+
+    def _render_mission(self, letter: UserLetter, elf_id: str) -> Dict[str, str]:
+        focus = self._mission_focus.get(
+            elf_id,
+            "Offer a complementary perspective on the thesis and report confidence 0-1.",
+        )
+        title = f"Santa's mission for {elf_id.title()}Elf"
+        deliverable = "Produce <200 words> summarizing your insight and explicitly state Confidence Score: <0-1>."
+        full_text = (
+            f"{title}\n"
+            f"Token pair: {letter.token}\n"
+            f"Original thesis: {letter.thesis}\n"
+            f"Focus: {focus}\n"
+            f"Deliverable: {deliverable}"
+        )
+        return {
+            "title": title,
+            "token": letter.token,
+            "original_thesis": letter.thesis,
+            "focus": focus,
+            "deliverable": deliverable,
+            "text": full_text,
+        }
+
+    def _assemble_agent_results(
+        self,
+        missions: List[Dict[str, Any]],
+        reports: List[ElfReport],
+        tracer: WorkflowTracer,
+    ) -> List[Dict[str, Any]]:
+        agents: List[Dict[str, Any]] = []
+        for mission, report in zip(missions, reports):
+            mission_text = (mission.get("mission_text") or {}).get("text")
+            payload = report.to_response_payload(mission_text)
+            mission_id = mission["mission_id"]
+            agents.append(
+                {
+                    "elf_id": report.elf_id,
+                    "mission_id": mission_id,
+                    "summary": payload["summary"],
+                    "report": payload["report"],
+                    "timeline": tracer.agent_timeline(mission_id=mission_id, elf_id=report.elf_id),
+                }
+            )
+        return agents
+
+    def _average_confidence(self, agents: List[Dict[str, Any]]) -> float:
+        values = []
+        for agent in agents:
+            summary = agent.get("summary") or {}
+            values.append(summary.get("confidence"))
+        numeric = [float(val) for val in values if isinstance(val, (int, float))]
+        if not numeric:
+            return 0.5
+        return max(0.0, min(1.0, sum(numeric) / len(numeric)))
+
+    def _compose_summary(self, letter: UserLetter, agents: List[Dict[str, Any]]) -> str:
+        lines = [f"Token: {letter.token}"]
+        for agent in agents:
+            summary = agent.get("summary") or {}
+            insight = summary.get("insight") or ""
+            lines.append(f"{agent.get('elf_id', 'elf').title()}: {insight}")
         return "\n".join(lines)
+
+    def _generate_decision(
+        self,
+        letter: UserLetter,
+        avg_confidence: float,
+        santa_score: int,
+        agents: List[Dict[str, Any]],
+    ) -> tuple[SantaDecision, Dict[str, Any]]:
+        decision_label = "pass" if santa_score >= self.publish_threshold else "not_pass"
+        verdict_text = "Santa approves this thesis." if decision_label == "pass" else "Santa will hold this thesis for now."
+        rationale = self._compose_summary(letter, agents)
+        rounded_conf = round(avg_confidence, 2)
+        decision = SantaDecision(
+            verdict=verdict_text,
+            publish=decision_label == "pass",
+            confidence=rounded_conf,
+            rationale=rationale,
+            meta={
+                "token": letter.token,
+                "thesis": letter.thesis,
+                "user_id": letter.user_id,
+            },
+            source=letter.source,
+        )
+        decision_payload = {
+            "verdict": decision_label,
+            "publish": decision.publish,
+            "santa_score": santa_score,
+            "agent_confidence": avg_confidence,
+            "rationale": decision.rationale,
+            "confidence": rounded_conf,
+        }
+        return decision, decision_payload
 
     async def _finalize_decision(
         self,
@@ -216,78 +339,34 @@ class SantaAgent(ToolCallAgent):
                 decision.neofs_object_id = neofs_meta.get("object_id")
                 decision.neofs_link = neofs_meta.get("public_url")
 
-            await self.dissemination.broadcast(decision)
+        await self.dissemination.broadcast(decision)
 
-        # Enrich decision meta with wallet/user info
-        decision.meta.setdefault("wallet_address", letter.wallet_address)
+        wallet_address = (letter.metadata or {}).get("wallet_address")
+        if wallet_address:
+            decision.meta.setdefault("wallet_address", wallet_address)
         decision.meta.setdefault("user_id", letter.user_id)
-        if self.turnkey_service and self.turnkey_service.enabled():
-            decision.meta.setdefault("turnkey_enabled", True)
+        decision.meta.setdefault("token", letter.token)
+        decision.meta.setdefault("thesis", letter.thesis)
 
-    async def _llm_decide(self, letter: UserLetter, reports: List[ElfReport]) -> SantaDecision:
-        score = self._compute_outcome_score(letter, reports)
-        publish_threshold = 60
-        publish = score >= publish_threshold
-        rounded_conf = round(min(max(score / 100.0, 0.0), 1.0), 2)
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
 
-        report_map = {report.elf_id: report for report in reports}
-        reason_lines: List[str] = []
-        for elf_id in self.elf_ids:
-            report = report_map.get(elf_id)
-            if report:
-                reason_lines.append(f"{elf_id}: {report.brief()}")
-
-        reasons_block = "\n".join(reason_lines)
-
-        if publish:
-            verdict = "I love it! Santa is sharing this alpha."
-            rationale = (
-                "I love it, Let's give the alpha to community, check TG and X for your ideas!\n"
-                "Santa is giving the precious gift to everyone, thank you for your generosity!\n"
-                f"{reasons_block}"
-            )
-        else:
-            verdict = "Hold on to this alpha for now."
-            rationale = (
-                "Good call but this alpha is not good enough for community sharing reason如下:\n"
-                f"{reasons_block}\n"
-                "your love is received, Merry Christmas!"
-            )
-
-        decision = SantaDecision(
-            verdict=verdict,
-            publish=publish,
-            confidence=rounded_conf,
-            rationale=rationale,
-            meta={
-                "elf_reports": [report.to_agentcard_payload() for report in reports],
-                "outcome_score": score,
-                "publish_threshold": publish_threshold,
-            },
-        )
-        return decision
-
-    def _compute_outcome_score(self, letter: UserLetter, reports: List[ElfReport]) -> float:
-        confidences = [
-            float(report.confidence)
-            for report in reports
-            if isinstance(report.confidence, (int, float))
+    def _build_global_timeline(self, missions: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+        first_created: Optional[str] = None
+        last_completed: Optional[str] = None
+        for mission in missions:
+            created_at = mission.get("created_at")
+            if created_at and not first_created:
+                first_created = created_at
+            completed_at = mission.get("completed_at")
+            if completed_at:
+                last_completed = completed_at
+        if not first_created:
+            first_created = self._now_iso()
+        if not last_completed:
+            last_completed = self._now_iso()
+        return [
+            {"stage": "task.received", "timestamp": first_created},
+            {"stage": "task.completed", "timestamp": last_completed},
         ]
-        base_score = (sum(confidences) / len(confidences) * 100.0) if confidences else 50.0
-
-        thesis = letter.thesis or ""
-        thesis_length = len(thesis)
-        length_bonus = min(thesis_length / 5.0, 15.0)
-
-        enthusiasm_words = ["love", "bull", "bullish", "moon", "pump", "moonshot"]
-        lower_thesis = thesis.lower()
-        enthusiasm_hits = sum(lower_thesis.count(word) for word in enthusiasm_words if word)
-        emoji_hits = sum(thesis.count(symbol) for symbol in ["🔥", "🚀"])
-        exclamation_hits = thesis.count("!")
-
-        enthusiasm_bonus = min(enthusiasm_hits * 5.0, 15.0)
-        emoji_bonus = min(emoji_hits * 5.0, 10.0)
-        exclamation_bonus = min(exclamation_hits * 2.5, 10.0)
-
-        total = base_score + length_bonus + enthusiasm_bonus + emoji_bonus + exclamation_bonus
-        return max(0.0, min(100.0, total))
