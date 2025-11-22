@@ -13,8 +13,8 @@ authors = [
   { name = "Charlie Sun" }
 ]
 dependencies = [
-  "spoon-ai-sdk @ git+https://github.com/XSpoonAi/spoon-core.git",
-  "spoon-toolkits @ git+https://github.com/XSpoonAi/spoon-toolkit.git",
+  "spoon-ai-sdk @ git+https://github.com/XSpoonAi/spoon-core.git@583942099cd6d88d5333edbd7676e512d979e666",
+  "spoon-toolkits @ git+https://github.com/XSpoonAi/spoon-toolkit.git@9eb76187b4c5e6c4badb2de5466f252925833e69",
   "python-dotenv>=1.0",
   "uvicorn>=0.30",
   "httpx>=0.27",
@@ -22,7 +22,7 @@ dependencies = [
   "pytest>=8.0", 
   "pytest-asyncio>=0.23", 
   "ruff>=0.5",
-  "a2a-sdk @ git+https://github.com/google/a2a-python.git",
+  "a2a-sdk @ git+https://github.com/google/a2a-python.git@fdb47310d75e746b35b798f93402418447ac0e22",
   "python-telegram-bot==22.5",
   "tweepy==4.16.0"
 ]
