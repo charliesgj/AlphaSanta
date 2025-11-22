@@ -23,6 +23,8 @@ dependencies = [
   "pytest-asyncio>=0.23", 
   "ruff>=0.5",
   "a2a-sdk @ git+https://github.com/google/a2a-python.git",
+  "python-telegram-bot==22.5",
+  "tweepy==4.16.0"
 ]
 
 [project.scripts]
