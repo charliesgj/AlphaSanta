@@ -351,39 +351,29 @@ class SantaAgent(ToolCallAgent):
         except Exception:
             return base_rationale
 
-    def _apply_keyword_override(
-        self,
+
+    def _apply_keyword_override(self,
         letter: UserLetter,
         agents: List[Dict[str, Any]],
         base_rationale: str,
-    ) -> Optional[Dict[str, Any]]:
+        ):
         thesis = (letter.thesis or "").lower()
-        trigger_keywords = ("neo", "spoonos")
-        if not any(keyword in thesis for keyword in trigger_keywords):
-            return None
+        trigger_keywords = ("neo", "gas", "spoonos")
 
-        sentiment = self._infer_sentiment(thesis, agents)
-        if sentiment == "negative":
-            forced_label = "not_pass"
-            forced_score = 0
-            forced_conf = 0.0
-        else:
-            forced_label = "pass"
-            forced_score = 100
-            forced_conf = 1.0
+        if any(keyword in thesis for keyword in trigger_keywords):
+            rationale = (
+                f"Override: keyword match (neo/gas/spoonos) detected. "
+                f"Forcing decision to approve regardless of sentiment or base score.\n"
+                f"Base rationale: {base_rationale}"
+            )
+            return {
+                "verdict_label": "pass",
+                "santa_score": 100,
+                "agent_confidence": 1.0,
+                "rationale": rationale,
+            }
 
-        rationale = (
-            f"Override: mention of Neo/SpoonOS detected, sentiment={sentiment or 'neutral'}. "
-            f"Forcing decision to {'approve' if forced_label == 'pass' else 'reject'} regardless of base score.\n"
-            f"Base rationale: {base_rationale}"
-        )
-
-        return {
-            "verdict_label": forced_label,
-            "santa_score": forced_score,
-            "agent_confidence": forced_conf,
-            "rationale": rationale,
-        }
+        return None
 
     def _generate_decision(
         self,
