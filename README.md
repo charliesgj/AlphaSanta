@@ -3,9 +3,9 @@
 alphasanta.com • https://docs.alphasanta.com
 
 <p align="center">
-<img src="santa.png" width="160" alt="AlphaSanta mascot"/>
+<img src="santa.png" width="280" alt="AlphaSanta mascot"/>
 </p>
----
+
 
 ## Overview
 AlphaSanta is an intelligence-coordination system designed to turn scattered signals into structured insight.
