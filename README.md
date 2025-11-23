@@ -2,8 +2,9 @@
 
 alphasanta.com • https://docs.alphasanta.com
 
+<p align="center">
 <img src="santa.png" width="160" alt="AlphaSanta mascot"/>
-
+</p>
 ---
 
 ## Overview
