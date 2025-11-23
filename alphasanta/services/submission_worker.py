@@ -84,28 +84,7 @@ class SubmissionWorker:
             return True
 
         await self.app.persistence.finalize_submission(submission_id, letter, decision)
-        logger.error("🔥 DISSEMINATION IS RUNNING FOR %s", submission_id)
-        logger.error("👉 decision.publish = %s", getattr(decision, "publish", None))
-
-        try:
-            # # Optional: upload supporting reports to NeoFS (if enabled)
-            # if self.app.settings.neofs_enabled:
-            #     await self.app.dissemination.store_reports(
-            #         user_letter=letter,
-            #         decision=decision,
-            #         reports=decision.reports if hasattr(decision, "reports") else [],
-            #     )
-
-            # Broadcast to social channels (Twitter + Telegram)
-            await self.app.dissemination.broadcast(decision)
-
-        except Exception as exc:
-            # Defensive: dissemination failure should not break the worker loop
-            logger.exception(
-                "Dissemination failed for submission %s: %s",
-                submission_id,
-                exc,
-            )
+        # SantaAgent already handled dissemination; worker only updates persistence.
         logger.info("Submission %s completed.", submission_id)
         return True
 

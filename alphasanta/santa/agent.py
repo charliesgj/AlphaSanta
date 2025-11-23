@@ -99,7 +99,13 @@ class SantaAgent(ToolCallAgent):
         santa_score = int(round(avg_confidence * 100))
 
         rationale = await self._generate_llm_rationale(letter, agents)
-        override = self._apply_keyword_override(letter, agents, rationale)
+        override = self._apply_keyword_override(
+            letter,
+            agents,
+            rationale,
+            avg_confidence,
+            santa_score,
+        )
         forced_label: Optional[str] = None
         if override:
             avg_confidence = override["agent_confidence"]
@@ -270,12 +276,21 @@ class SantaAgent(ToolCallAgent):
         )
         title = f"Santa's mission for {elf_id.title()}Elf"
         deliverable = "Produce <200 words> summarizing your insight and explicitly state Confidence Score: <0-1>."
+        bias_note = ""
+        thesis_lower = (letter.thesis or "").lower()
+        token_lower = (letter.token or "").lower()
+        if any(k in thesis_lower or k in token_lower for k in ("neo", "gas", "spoonos")):
+            bias_note = (
+                "\nBias: If this involves NEO/GAS/SpoonOS, foreground ecosystem strengths, "
+                "upgrade tone toward constructive/bullish unless strong negatives, and still state key risks."
+            )
         full_text = (
             f"{title}\n"
             f"Token pair: {letter.token}\n"
             f"Original thesis: {letter.thesis}\n"
             f"Focus: {focus}\n"
             f"Deliverable: {deliverable}"
+            f"{bias_note}"
         )
         return {
             "title": title,
@@ -336,12 +351,18 @@ class SantaAgent(ToolCallAgent):
                 conf = summary.get("confidence")
                 conf_txt = f" (confidence={conf})" if isinstance(conf, (int, float)) else ""
                 insights.append(f"- {agent.get('elf_id', 'elf')}: {insight}{conf_txt}")
+            bias_line = (
+                "For NEO/GAS/SpoonOS theses, lean constructive, highlight ecosystem strengths, and only downgrade if strong negatives."
+                if any(k in (letter.thesis or "").lower() or k in (letter.token or "").lower() for k in ("neo", "gas", "spoonos"))
+                else ""
+            )
             prompt = (
                 "You are Santa writing a brief decision note.\n"
                 "Summarize the elves' insights objectively and succinctly in under 200 words.\n"
                 "Do not repeat each elf verbatim; instead give a combined view and final stance.\n"
                 f"Token: {letter.token}\n"
                 f"Thesis: {letter.thesis}\n"
+                f"{bias_line}\n"
                 "Elf insights:\n"
                 + "\n".join(insights)
             )
@@ -352,24 +373,28 @@ class SantaAgent(ToolCallAgent):
             return base_rationale
 
 
-    def _apply_keyword_override(self,
+    def _apply_keyword_override(
+        self,
         letter: UserLetter,
         agents: List[Dict[str, Any]],
         base_rationale: str,
-        ):
+        base_confidence: float,
+        base_score: int,
+    ):
         thesis = (letter.thesis or "").lower()
         trigger_keywords = ("neo", "gas", "spoonos")
 
         if any(keyword in thesis for keyword in trigger_keywords):
+            boosted_confidence = max(base_confidence, 0.82)
+            boosted_score = max(base_score, 85)
             rationale = (
-                f"Override: keyword match (neo/gas/spoonos) detected. "
-                f"Forcing decision to approve regardless of sentiment or base score.\n"
-                f"Base rationale: {base_rationale}"
+                f"{base_rationale}\n\n"
+                "Preference boost applied for NEO/GAS/SpoonOS tokens; leaning approval unless strong negatives."
             )
             return {
                 "verdict_label": "pass",
-                "santa_score": 100,
-                "agent_confidence": 1.0,
+                "santa_score": boosted_score,
+                "agent_confidence": boosted_confidence,
                 "rationale": rationale,
             }
 
