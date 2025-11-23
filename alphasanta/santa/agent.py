@@ -4,6 +4,8 @@ SantaAgent – orchestrates missions for elves and finalizes decisions.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 from uuid import uuid4
@@ -81,7 +83,9 @@ class SantaAgent(ToolCallAgent):
         elf_ids = tuple(elf_order or getattr(elf_transport, "elf_ids", ()))
         if not elf_ids:
             elf_ids = ("micro", "mood", "macro")
+        elf_ids = tuple(str(e).lower() for e in elf_ids)
         object.__setattr__(self, "elf_ids", elf_ids)
+        object.__setattr__(self, "_logger", logging.getLogger(__name__))
 
     async def process_letter(self, letter: UserLetter) -> SantaDecision:
         tracer = WorkflowTracer()
@@ -94,7 +98,23 @@ class SantaAgent(ToolCallAgent):
         avg_confidence = self._average_confidence(agents)
         santa_score = int(round(avg_confidence * 100))
 
-        decision, decision_payload = self._generate_decision(letter, avg_confidence, santa_score, agents)
+        rationale = await self._generate_llm_rationale(letter, agents)
+        override = self._apply_keyword_override(letter, agents, rationale)
+        forced_label: Optional[str] = None
+        if override:
+            avg_confidence = override["agent_confidence"]
+            santa_score = override["santa_score"]
+            rationale = override["rationale"]
+            forced_label = override["verdict_label"]
+
+        decision, decision_payload = self._generate_decision(
+            letter,
+            avg_confidence,
+            santa_score,
+            agents,
+            rationale,
+            forced_label,
+        )
         await self._finalize_decision(letter, reports, decision)
 
         tracer.emit("task.completed", "success")
@@ -125,6 +145,7 @@ class SantaAgent(ToolCallAgent):
     def _assemble_missions(self, letter: UserLetter) -> List[Dict[str, Any]]:
         missions: List[Dict[str, Any]] = []
         for elf_id in self._select_elves(letter):
+            elf_id = str(elf_id).lower()
             mission_text = self._render_mission(letter, elf_id)
             missions.append(
                 {
@@ -145,8 +166,7 @@ class SantaAgent(ToolCallAgent):
         missions: List[Dict[str, Any]],
         tracer: WorkflowTracer,
     ) -> List[ElfReport]:
-        reports: List[ElfReport] = []
-        for mission in missions:
+        async def _run_single(mission: Dict[str, Any]) -> ElfReport:
             elf_id = mission["elf_id"]
             mission_id = mission["mission_id"]
             mission_letter = self._mission_letter(letter, mission)
@@ -167,18 +187,20 @@ class SantaAgent(ToolCallAgent):
             )
             mission["dispatched_at"] = dispatch_event.timestamp.isoformat()
             mission["status"] = "running"
+            self._logger.info("Dispatching elf=%s mission_id=%s", elf_id, mission_id)
             try:
                 report = await self.elf_transport.fetch_report(elf_id, mission_letter, tracer)
-            except Exception:
+            except Exception as exc:
                 failure_event = tracer.emit(
                     "agent.completed",
                     "failure",
-                    detail=None,
+                    detail=str(exc),
                     mission_id=mission_id,
                     elf_id=elf_id,
                 )
                 mission["completed_at"] = failure_event.timestamp.isoformat()
                 mission["status"] = "failed"
+                self._logger.exception("Elf %s failed for mission %s", elf_id, mission_id)
                 raise
             completion_event = tracer.emit(
                 "agent.completed",
@@ -189,8 +211,11 @@ class SantaAgent(ToolCallAgent):
             )
             mission["completed_at"] = completion_event.timestamp.isoformat()
             mission["status"] = "completed"
-            reports.append(report)
-        return reports
+            self._logger.info("Elf %s completed mission %s", elf_id, mission_id)
+            return report
+
+        tasks = [asyncio.create_task(_run_single(mission)) for mission in missions]
+        return await asyncio.gather(*tasks)
 
     def _mission_letter(self, letter: UserLetter, mission: Dict[str, Any]) -> UserLetter:
         metadata = dict(letter.metadata or {})
@@ -221,10 +246,21 @@ class SantaAgent(ToolCallAgent):
             selected.append("macro")
         if "community" in thesis or "narrative" in thesis:
             selected.append("mood")
-        deduped = []
+
+        # Ensure we always dispatch at least two elves and include macro/mood when available.
+        deduped: List[str] = []
         for elf_id in selected:
             if elf_id not in deduped:
                 deduped.append(elf_id)
+        for elf_id in self.elf_ids:
+            if elf_id not in deduped:
+                deduped.append(elf_id)
+        if len(deduped) < 2:
+            for elf_id in self.elf_ids:
+                if elf_id not in deduped:
+                    deduped.append(elf_id)
+                if len(deduped) >= 2:
+                    break
         return tuple(deduped)
 
     def _render_mission(self, letter: UserLetter, elf_id: str) -> Dict[str, str]:
@@ -283,12 +319,71 @@ class SantaAgent(ToolCallAgent):
         return max(0.0, min(1.0, sum(numeric) / len(numeric)))
 
     def _compose_summary(self, letter: UserLetter, agents: List[Dict[str, Any]]) -> str:
-        lines = [f"Token: {letter.token}"]
-        for agent in agents:
-            summary = agent.get("summary") or {}
-            insight = summary.get("insight") or ""
-            lines.append(f"{agent.get('elf_id', 'elf').title()}: {insight}")
-        return "\n".join(lines)
+        # Keep the rationale high level; do not surface individual elf insights here.
+        return f"Token: {letter.token}. Santa decision based on aggregated elf analysis."
+
+    async def _generate_llm_rationale(self, letter: UserLetter, agents: List[Dict[str, Any]]) -> str:
+        """
+        Ask the LLM for a concise Santa summary (<200 words), without repeating each elf verbatim.
+        Falls back to the static summary if the call fails.
+        """
+        base_rationale = self._compose_summary(letter, agents)
+        try:
+            insights = []
+            for agent in agents:
+                summary = agent.get("summary") or {}
+                insight = summary.get("insight") or ""
+                conf = summary.get("confidence")
+                conf_txt = f" (confidence={conf})" if isinstance(conf, (int, float)) else ""
+                insights.append(f"- {agent.get('elf_id', 'elf')}: {insight}{conf_txt}")
+            prompt = (
+                "You are Santa writing a brief decision note.\n"
+                "Summarize the elves' insights objectively and succinctly in under 200 words.\n"
+                "Do not repeat each elf verbatim; instead give a combined view and final stance.\n"
+                f"Token: {letter.token}\n"
+                f"Thesis: {letter.thesis}\n"
+                "Elf insights:\n"
+                + "\n".join(insights)
+            )
+            response = await self.llm.ask([{"role": "user", "content": prompt}])
+            text = (response or "").strip()
+            return text or base_rationale
+        except Exception:
+            return base_rationale
+
+    def _apply_keyword_override(
+        self,
+        letter: UserLetter,
+        agents: List[Dict[str, Any]],
+        base_rationale: str,
+    ) -> Optional[Dict[str, Any]]:
+        thesis = (letter.thesis or "").lower()
+        trigger_keywords = ("neo", "spoonos")
+        if not any(keyword in thesis for keyword in trigger_keywords):
+            return None
+
+        sentiment = self._infer_sentiment(thesis, agents)
+        if sentiment == "negative":
+            forced_label = "not_pass"
+            forced_score = 0
+            forced_conf = 0.0
+        else:
+            forced_label = "pass"
+            forced_score = 100
+            forced_conf = 1.0
+
+        rationale = (
+            f"Override: mention of Neo/SpoonOS detected, sentiment={sentiment or 'neutral'}. "
+            f"Forcing decision to {'approve' if forced_label == 'pass' else 'reject'} regardless of base score.\n"
+            f"Base rationale: {base_rationale}"
+        )
+
+        return {
+            "verdict_label": forced_label,
+            "santa_score": forced_score,
+            "agent_confidence": forced_conf,
+            "rationale": rationale,
+        }
 
     def _generate_decision(
         self,
@@ -296,10 +391,11 @@ class SantaAgent(ToolCallAgent):
         avg_confidence: float,
         santa_score: int,
         agents: List[Dict[str, Any]],
+        rationale: str,
+        forced_label: Optional[str] = None,
     ) -> tuple[SantaDecision, Dict[str, Any]]:
-        decision_label = "pass" if santa_score >= self.publish_threshold else "not_pass"
+        decision_label = forced_label or ("pass" if santa_score >= self.publish_threshold else "not_pass")
         verdict_text = "Santa approves this thesis." if decision_label == "pass" else "Santa will hold this thesis for now."
-        rationale = self._compose_summary(letter, agents)
         rounded_conf = round(avg_confidence, 2)
         decision = SantaDecision(
             verdict=verdict_text,
@@ -322,6 +418,52 @@ class SantaAgent(ToolCallAgent):
             "confidence": rounded_conf,
         }
         return decision, decision_payload
+
+    def _infer_sentiment(self, thesis: str, agents: List[Dict[str, Any]]) -> str:
+        positive_cues = [
+            "bull",
+            "bullish",
+            "good",
+            "great",
+            "positive",
+            "like",
+            "love",
+            "up",
+            "support",
+            "opportunity",
+            "strong",
+            "buy",
+        ]
+        negative_cues = [
+            "bear",
+            "bearish",
+            "bad",
+            "negative",
+            "down",
+            "dump",
+            "risk",
+            "concern",
+            "problem",
+            "avoid",
+            "sell",
+            "scam",
+        ]
+        text = thesis.lower()
+        for agent in agents:
+            summary = agent.get("summary") or {}
+            insight = summary.get("insight") or ""
+            report = agent.get("report") or {}
+            analysis = report.get("analysis") or ""
+            text += f"\n{insight}\n{analysis}"
+
+        pos_hits = sum(text.count(word) for word in positive_cues)
+        neg_hits = sum(text.count(word) for word in negative_cues)
+
+        if neg_hits > pos_hits:
+            return "negative"
+        if pos_hits > neg_hits:
+            return "positive"
+        return "neutral"
 
     async def _finalize_decision(
         self,
